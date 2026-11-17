@@ -48,6 +48,7 @@ This keeps Shift from leaking onto neighbouring keys and keeps line breaks and d
 """
 
 import argparse
+import contextlib
 import json
 import math
 import random
@@ -58,12 +59,7 @@ import time
 
 from pynput import keyboard
 
-# macOS fix: pynput's hotkey listener reads the keyboard layout from its own
-# background thread, and newer macOS versions crash any app that does that
-# (it must happen on the main thread). We read it once here, on the main
-# thread at import time, and hand the listener the saved copy instead.
 if sys.platform == "darwin":
-    import contextlib
     try:
         import pynput._util.darwin as _pyn_util
         import pynput.keyboard._darwin as _pyn_kb
@@ -292,6 +288,47 @@ class Typer:
         self.drift = 0.0     # slow wander in overall speed
         self.cautious = 0    # keystrokes left to type a bit slower after an error
 
+        # rhythm-mode state machine: discrete mode switches instead of smooth drift
+        self.rhythm_mode = "normal"   # normal | burst | careful | stall
+        self.mode_remaining = random.randint(10, 40)
+
+        # consecutive overlap counter, so rollover doesn't produce long paste-like runs
+        self.overlap_streak = 0
+
+        # micro-pause counter, breaks up fast runs
+        self.chars_since_micropause = 0
+
+    # rhythm state machine
+    def update_rhythm(self):
+        """Pick a new rhythm mode when the current one is exhausted. Discrete
+        mode switches produce the abrupt rhythm changes real typists have,
+        which smooth statistical drift doesn't."""
+        if self.mode_remaining > 0:
+            self.mode_remaining -= 1
+            return
+        r = random.random()
+        if r < 0.12:
+            self.rhythm_mode = "burst"       # familiar phrase, type fast
+            self.mode_remaining = random.randint(4, 12)
+        elif r < 0.22:
+            self.rhythm_mode = "careful"     # unfamiliar word, slow down
+            self.mode_remaining = random.randint(3, 8)
+        elif r < 0.25:
+            self.rhythm_mode = "stall"       # mid-word hesitation, one key
+            self.mode_remaining = 1
+        else:
+            self.rhythm_mode = "normal"
+            self.mode_remaining = random.randint(10, 40)
+
+    def rhythm_multiplier(self):
+        if self.rhythm_mode == "burst":
+            return 0.55
+        if self.rhythm_mode == "careful":
+            return 2.0
+        if self.rhythm_mode == "stall":
+            return random.uniform(3.0, 8.0)
+        return 1.0
+
     # low-level keys
     def dwell(self, key):
         """How long to hold a key down (seconds)."""
@@ -307,15 +344,20 @@ class Typer:
         """Press a key and schedule its release after the dwell time.
         Returns the dwell used. If overlap is allowed (and --rollover or
         --rollover-rate is on), the previous key may still be down when this
-        one is pressed."""
+        one is pressed. Consecutive overlaps are capped at 2 so we never
+        produce a paste-like run of near-zero-gap inserts."""
         d = self.dwell(key)
         can_overlap = (
             overlap
             and (self.args.rollover or self.args.rollover_rate > 0)
             and not any(k == key for _, k in held_keys)  # can't press a key that's already down
             and len(held_keys) < MAX_HELD
+            and self.overlap_streak < 2
         )
-        if not can_overlap:
+        if can_overlap:
+            self.overlap_streak += 1
+        else:
+            self.overlap_streak = 0
             r = held_remaining()
             if r > 0:
                 wait(r)  # let earlier keys finish their hold first
@@ -339,6 +381,16 @@ class Typer:
             d = self.tap(Key.backspace)
             wait(d + random.uniform(0.035, 0.09))
 
+    def word_backspace(self, n_words):
+        """Delete n_words using Option+Backspace (macOS word-delete). Humans
+        use this to retract false starts, which looks different in the edit
+        stream than character-by-character backspacing."""
+        for _ in range(n_words):
+            with kb.pressed(Key.alt):
+                kb.press(Key.backspace)
+                kb.release(Key.backspace)
+            wait(random.uniform(0.08, 0.22))
+
     # timing
     def key_delay(self, ch, nxt=None):
         """Press-to-press time from ch to the next key.
@@ -357,6 +409,10 @@ class Typer:
         self.drift = max(-0.35, min(0.35, self.drift))
         d *= math.exp(self.drift)
 
+        # discrete rhythm mode on top of the smooth drift
+        self.update_rhythm()
+        d *= self.rhythm_multiplier()
+
         # typing is a bit careful for a few keys after making a mistake
         if self.cautious > 0:
             d *= 1.25
@@ -371,9 +427,15 @@ class Typer:
         if ch in ",;:":
             return random.uniform(0.1, 0.45) * s
         if ch == "\n":
-            return random.uniform(0.8, 2.5) * s
+            # 70% a normal paragraph break, 30% a long "staring at the blank line"
+            if random.random() < 0.3:
+                return random.uniform(8, 25) * s
+            return random.uniform(1.5, 4.0) * s
         if ch == " " and random.random() < self.args.think_rate:
-            return random.uniform(0.8, 3.0) * s
+            # bimodal: mostly short thinks, sometimes a real "where was I going" pause
+            if random.random() < 0.25:
+                return random.uniform(5, 18) * s
+            return random.uniform(0.6, 2.2) * s
         return 0.0
 
     def rolls_into(self, ch, nxt):
@@ -387,6 +449,7 @@ class Typer:
             and ch != nxt                       # can't press a key that's already down
             and pair_class(ch, nxt) != "same_finger"  # one finger can't roll
             and (ch + nxt) in FAST_BIGRAMS
+            and self.overlap_streak < 2         # no long overlap runs
             and random.random() < self.args.rollover_rate
         )
 
@@ -400,6 +463,14 @@ class Typer:
         elif not self.args.rollover:
             # no overlap: the next press can't come until this key is released
             interval = max(interval, held + 0.01)
+
+        # micro-pause to break up fast runs: humans can't sustain 120 WPM for
+        # more than a handful of letters at a time
+        self.chars_since_micropause += 1
+        if self.chars_since_micropause > random.randint(3, 6):
+            interval += random.uniform(0.06, 0.15)
+            self.chars_since_micropause = 0
+
         if with_pauses:
             interval += self.pause_after(ch)
         self.prev = ch
@@ -412,10 +483,20 @@ class Typer:
 
     # behaviours
     def type_and_retract(self, s, think=(0.6, 2.0)):
-        """Type s, pause as if reconsidering, delete it."""
-        self.type_plain(s)
+        """Type s with a chance of mid-phrase hesitation, pause as if
+        reconsidering, then delete it word-by-word with Option+Backspace.
+        This produces a different edit-stream signature than the old
+        char-by-char backspacing."""
+        words = s.split(" ")
+        for i, w in enumerate(words):
+            self.type_plain(w)
+            if i < len(words) - 1:
+                self.emit(" ", with_pauses=False)
+                if random.random() < 0.4:
+                    wait(random.uniform(0.4, 1.2))  # hesitation mid-false-start
         wait(random.uniform(*think))
-        self.backspace(len(s))
+        # delete word-by-word with Opt+Backspace; handle any trailing space
+        self.word_backspace(len(words))
         wait(random.uniform(0.2, 0.8))
 
     def typo_weight(self, ch):
@@ -482,9 +563,26 @@ class Typer:
         return keep
 
     def run(self, text, alternates, on_progress=None):
-        i, n = 0, len(text)
+        n = len(text)
+
+        # schedule 2-4 long idle gaps spread through the second half of the
+        # text; real writers don't type for 15 minutes straight
+        if n > 500:
+            idle_points = sorted(random.sample(
+                range(n // 4, n), k=random.randint(2, 4)
+            ))
+        else:
+            idle_points = []
+
+        i = 0
         while i < n:
             ch = text[i]
+
+            # long idle gap simulating interruption
+            if idle_points and i >= idle_points[0]:
+                idle_points.pop(0)
+                wait(random.uniform(20, 90))
+
             word_start = ch not in " \n\t" and (i == 0 or text[i - 1] in " \n\t")
 
             if i in alternates:
@@ -620,7 +718,7 @@ def main():
     print(f"{len(text)} characters, roughly {est:.1f} min at {args.wpm:g} WPM.")
     if args.wpm > 90 and not args.rollover:
         print("[tip] Above ~90 WPM the key holds eat into the gap between keys, "
-              "so you'll type slower than --wpm. Add --rollover to fix that.")
+            "so you'll type slower than --wpm. Add --rollover to fix that.")
     print("F8 = pause/resume, Esc = stop.")
 
     listener = keyboard.Listener(on_press=on_press)

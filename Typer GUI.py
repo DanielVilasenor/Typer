@@ -9,10 +9,13 @@ Paste or load your text, set the sliders, press Start, and click into your
 Google Doc / form field during the countdown.
     F8  = pause / resume      Esc = stop
 """
+import json
 import os
 import queue
+import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
 from types import SimpleNamespace
 
@@ -21,208 +24,328 @@ from pynput import keyboard
 import Typer as ht
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
+APP_NAME = "Human Typer"
+TAGLINE = "Types the way a person would \u2014 imperfectly, at a human pace."
+
+# --- palette ---------------------------------------------------------------
+PAGE = "#ffffff"       # everything content sits on
+SOFT = "#f3f4f6"       # input fills, inactive hover
+INK = "#111827"        # primary text
+MUTED = "#6b7280"      # secondary text
+ACCENT = "#4f46e5"     # indigo: header, sliders, primary action
+ACCENT_HI = "#4338ca"  # hover / pressed
+ACCENT_SOFT = "#c7d2fe"
+HEADER_SUB = "#c7d2fe"
+BORDER = "#e5e7eb"
+TROUGH = "#e5e7eb"
 
 
-class ScrollFrame(ttk.Frame):
-    """A vertically scrollable container. Put content in `self.body`."""
+def settings_path():
+    """Per-user settings file; falls back to the home folder if needed."""
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    folder = os.path.join(base, "HumanTyper")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        folder = os.path.expanduser("~")
+    return os.path.join(folder, "settings.json")
 
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.canvas = tk.Canvas(self, highlightthickness=0)
-        vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
 
-        self.body = ttk.Frame(self.canvas)
-        self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
-
-        # keep the scroll region in sync with the body's size
-        self.body.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
-        )
-        # make the body as wide as the canvas (so fill="x" works, no sideways scroll)
-        self.canvas.bind(
-            "<Configure>",
-            lambda e: self.canvas.itemconfigure(self._win, width=e.width),
-        )
-        # only grab the wheel while the pointer is over this area
-        self.canvas.bind("<Enter>", self._bind_wheel)
-        self.canvas.bind("<Leave>", self._unbind_wheel)
-
-    def _bind_wheel(self, _e=None):
-        self.canvas.bind_all("<MouseWheel>", self._on_wheel)   # Windows / macOS
-        self.canvas.bind_all("<Button-4>", self._on_wheel)     # Linux scroll up
-        self.canvas.bind_all("<Button-5>", self._on_wheel)     # Linux scroll down
-
-    def _unbind_wheel(self, _e=None):
-        self.canvas.unbind_all("<MouseWheel>")
-        self.canvas.unbind_all("<Button-4>")
-        self.canvas.unbind_all("<Button-5>")
-
-    def _on_wheel(self, e):
-        if getattr(e, "num", None) == 4:
-            step = -1
-        elif getattr(e, "num", None) == 5:
-            step = 1
-        elif abs(e.delta) >= 120:      # Windows reports multiples of 120
-            step = int(-e.delta / 120)
-        else:                          # macOS reports small deltas
-            step = -1 if e.delta > 0 else 1
-        self.canvas.yview_scroll(step, "units")
+def ui_family():
+    if sys.platform == "darwin":
+        return "Helvetica Neue"
+    if sys.platform.startswith("win"):
+        return "Segoe UI"
+    return "DejaVu Sans"
 
 
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Human Typer")
-        root.minsize(560, 460)
+        root.title(APP_NAME)
+        root.minsize(600, 600)
+        root.configure(bg=PAGE)
 
         self.q = queue.Queue()
         self.worker = None
         self.listener = None
         self.was_paused = False
-        self.vars = {}
 
-        style = ttk.Style()
+        self.vars = {}            # slider key -> DoubleVar (used by run logic)
+        self._persist = {}        # key -> tk Variable we save/restore
+        self._ranges = {}         # slider key -> (lo, hi) for clamping on load
+        self._defaults = {}       # key -> factory default
+        self._settings_file = settings_path()
+
+        self.tabs = {}            # name -> content frame
+        self.tab_btns = {}        # name -> button
+
+        self.fam = ui_family()
+        self._build_fonts()
+        self._build_style()
+
+        self._build_header(root)
+        self._build_actions(root)     # pinned bottom
+        self._build_body(root)        # text + tabs in the middle
+
+        for key in ("wpm", "pause"):
+            self.vars[key].trace_add("write", lambda *_: self.update_estimate())
+
+        self.load_settings()
+        self.update_estimate()
+        self.show_tab("Typing")
+
+        root.update_idletasks()
+        want = root.winfo_reqheight()
+        screen = root.winfo_screenheight()
+        root.geometry(f"660x{min(max(want, 640), screen - 100)}")
+
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.after(100, self.poll)
+
+    # --------------------------------------------------------------- styling --
+    def _build_fonts(self):
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            try:
+                tkfont.nametofont(name).configure(family=self.fam, size=12)
+            except tk.TclError:
+                pass
+        self.f_h1 = (self.fam, 17, "bold")
+        self.f_h2 = (self.fam, 13, "bold")
+        self.f_small = (self.fam, 11)
+        self.f_value = (self.fam, 12, "bold")
+
+    def _build_style(self):
+        s = ttk.Style()
         try:
-            style.theme_use("clam")
+            s.theme_use("clam")
         except tk.TclError:
             pass
 
-        main = ttk.Frame(root)
-        main.pack(fill="both", expand=True)
+        s.configure(".", background=PAGE, foreground=INK)
+        s.configure("TFrame", background=PAGE)
+        s.configure("TLabel", background=PAGE, foreground=INK)
+        s.configure("Muted.TLabel", background=PAGE, foreground=MUTED, font=self.f_small)
+        s.configure("H2.TLabel", background=PAGE, foreground=INK, font=self.f_h2)
+        s.configure("Value.TLabel", background=PAGE, foreground=ACCENT, font=self.f_value)
 
-        # --- bottom action area (pinned; always visible) ----------------
-        bottom = ttk.Frame(main, padding=(12, 8, 12, 10))
+        s.configure("TCheckbutton", background=PAGE, foreground=INK)
+        s.map("TCheckbutton", background=[("active", PAGE)])
+
+        s.configure("Horizontal.TScale", background=PAGE, troughcolor=TROUGH,
+                    bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT, sliderlength=20)
+
+        s.configure("TEntry", fieldbackground=SOFT, foreground=INK, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, insertcolor=INK, padding=7, relief="flat")
+
+        s.configure("Horizontal.TProgressbar", troughcolor=TROUGH, background=ACCENT,
+                    bordercolor=TROUGH, lightcolor=ACCENT, darkcolor=ACCENT, thickness=6)
+        s.configure("TSeparator", background=BORDER)
+
+        # secondary button
+        s.configure("TButton", background=SOFT, foreground=INK, bordercolor=BORDER,
+                    lightcolor=SOFT, darkcolor=SOFT, relief="flat", padding=(14, 9))
+        s.map("TButton", background=[("active", "#e5e7eb"), ("disabled", "#f3f4f6")],
+              foreground=[("disabled", MUTED)])
+        # primary
+        s.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", bordercolor=ACCENT,
+                    lightcolor=ACCENT, darkcolor=ACCENT, relief="flat", padding=(24, 9))
+        s.map("Accent.TButton", background=[("active", ACCENT_HI), ("disabled", ACCENT_SOFT)],
+              foreground=[("disabled", "#eef2ff")])
+        # ghost / link
+        s.configure("Ghost.TButton", background=PAGE, foreground=ACCENT, bordercolor=PAGE,
+                    lightcolor=PAGE, darkcolor=PAGE, relief="flat", padding=(10, 6))
+        s.map("Ghost.TButton", foreground=[("active", ACCENT_HI)], background=[("active", PAGE)])
+        # tab pills
+        s.configure("Tab.TButton", background=PAGE, foreground=MUTED, bordercolor=PAGE,
+                    lightcolor=PAGE, darkcolor=PAGE, relief="flat", padding=(18, 9))
+        s.map("Tab.TButton", background=[("active", SOFT)], foreground=[("active", INK)])
+        s.configure("TabOn.TButton", background=ACCENT, foreground="#ffffff", bordercolor=ACCENT,
+                    lightcolor=ACCENT, darkcolor=ACCENT, relief="flat", padding=(18, 9))
+        s.map("TabOn.TButton", background=[("active", ACCENT_HI)], foreground=[("active", "#ffffff")])
+
+    # ---------------------------------------------------------------- layout --
+    def _build_header(self, root):
+        band = tk.Frame(root, bg=ACCENT)
+        band.pack(side="top", fill="x")
+        row = tk.Frame(band, bg=ACCENT)
+        row.pack(fill="x", padx=20, pady=(16, 2))
+        tk.Label(row, text=APP_NAME, bg=ACCENT, fg="#ffffff", font=self.f_h1).pack(side="left")
+        self.estimate = tk.Label(row, text="", bg=ACCENT, fg=HEADER_SUB, font=self.f_small)
+        self.estimate.pack(side="right", pady=(6, 0))
+        tk.Label(band, text=TAGLINE, bg=ACCENT, fg=HEADER_SUB,
+                 font=self.f_small).pack(anchor="w", padx=20, pady=(0, 16))
+
+    def _build_actions(self, root):
+        ttk.Separator(root, orient="horizontal").pack(side="bottom", fill="x")
+        bottom = ttk.Frame(root, padding=(20, 12, 20, 14))
         bottom.pack(side="bottom", fill="x")
-        ttk.Separator(main, orient="horizontal").pack(side="bottom", fill="x")
 
         bar = ttk.Frame(bottom)
         bar.pack(fill="x")
-        self.start_btn = ttk.Button(bar, text="Start", command=self.start)
+        self.start_btn = ttk.Button(bar, text="Start", style="Accent.TButton", command=self.start)
         self.start_btn.pack(side="left")
         self.pause_btn = ttk.Button(bar, text="Pause", command=self.toggle_pause, state="disabled")
-        self.pause_btn.pack(side="left", padx=6)
+        self.pause_btn.pack(side="left", padx=8)
         self.stop_btn = ttk.Button(bar, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left")
-        self.estimate = ttk.Label(bar, text="")
-        self.estimate.pack(side="right")
 
         self.progress = ttk.Progressbar(bottom, maximum=100)
-        self.progress.pack(fill="x", pady=(8, 2))
-        self.status = ttk.Label(bottom, text="Ready.")
-        self.status.pack(anchor="w")
+        self.progress.pack(fill="x", pady=(12, 6))
 
-        # --- text area (top; fixed height, own scrollbar) ---------------
-        textwrap = ttk.Frame(main, padding=(12, 12, 12, 6))
-        textwrap.pack(side="top", fill="x")
+        line = ttk.Frame(bottom)
+        line.pack(fill="x")
+        self.status = ttk.Label(line, text="Ready.", style="Muted.TLabel")
+        self.status.pack(side="left")
+        ttk.Label(line, text="Settings saved automatically", style="Muted.TLabel").pack(side="right")
 
-        hdr = ttk.Frame(textwrap)
-        hdr.pack(fill="x")
-        ttk.Label(hdr, text="Text to type", font=("", 11, "bold")).pack(side="left")
-        ttk.Button(hdr, text="Load file…", command=self.load_file).pack(side="right")
-        ttk.Button(hdr, text="Clear", command=lambda: self.text.delete("1.0", "end")).pack(side="right", padx=4)
+    def _build_body(self, root):
+        body = ttk.Frame(root, padding=(20, 16, 20, 8))
+        body.pack(side="top", fill="both", expand=True)
 
-        tbox = ttk.Frame(textwrap)
-        tbox.pack(fill="x", pady=(4, 0))
+        head = ttk.Frame(body)
+        head.pack(fill="x")
+        ttk.Label(head, text="Text to type", style="H2.TLabel").pack(side="left")
+        ttk.Button(head, text="Load file\u2026", command=self.load_file).pack(side="right")
+        ttk.Button(head, text="Clear", command=lambda: self.text.delete("1.0", "end")).pack(side="right", padx=6)
+
+        tbox = ttk.Frame(body)
+        tbox.pack(fill="x", pady=(10, 0))
         tscroll = ttk.Scrollbar(tbox, orient="vertical")
-        self.text = tk.Text(tbox, height=7, wrap="word", undo=True, padx=6, pady=6,
-                            yscrollcommand=tscroll.set)
+        self.text = tk.Text(
+            tbox, height=6, wrap="word", undo=True, padx=12, pady=10,
+            relief="flat", borderwidth=0, bg=SOFT, fg=INK, insertbackground=ACCENT,
+            selectbackground="#dbe3ff", selectforeground=INK,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+            yscrollcommand=tscroll.set,
+        )
         tscroll.config(command=self.text.yview)
         tscroll.pack(side="right", fill="y")
         self.text.pack(side="left", fill="both", expand=True)
         self.text.bind("<<Modified>>", self.on_text_modified)
 
-        # --- scrollable settings ----------------------------------------
-        scroller = ScrollFrame(main)
-        scroller.pack(side="top", fill="both", expand=True)
-        body = scroller.body
+        # tab bar (pills) + swappable panel below ----------------------------
+        self.tabbar = ttk.Frame(body)
+        self.tabbar.pack(fill="x", pady=(18, 0))
+        self.tabwrap = ttk.Frame(body)
+        self.tabwrap.pack(fill="both", expand=True, pady=(12, 0))
 
-        typing = ttk.LabelFrame(body, text="Typing", padding=8)
-        typing.pack(fill="x", padx=12, pady=(8, 0))
-        self.slider(typing, "wpm", "Speed (WPM)", 15, 140, 55, "{:.0f}")
-        self.slider(typing, "typo", "Typos (% of letters)", 0, 10, 3, "{:.1f}%")
-        self.slider(typing, "revise", "Retype hesitations (% of words)", 0, 6, 1.5, "{:.1f}%")
-        self.slider(typing, "think", "Thinking pauses (% of spaces)", 0, 15, 3, "{:.1f}%")
-        self.slider(typing, "pause", "Pause length", 0.25, 3, 1.0, "{:.2f}x")
-        self.slider(typing, "countdown", "Countdown", 2, 15, 5, "{:.0f}s")
+        self._tab_typing(self._new_tab("Typing"))
+        self._tab_realism(self._new_tab("Realism"))
+        self._tab_ai(self._new_tab("AI"))
+        self._tab_general(self._new_tab("General"))
 
-        realism = ttk.LabelFrame(body, text="Realism", padding=8)
-        realism.pack(fill="x", padx=12, pady=8)
-        self.slider(realism, "dwell_min", "Key hold min (ms)", 30, 120, 70, "{:.0f} ms")
-        self.slider(realism, "dwell_max", "Key hold max (ms)", 60, 260, 150, "{:.0f} ms")
-        self.slider(realism, "rollover_rate", "Overlap common pairs (%)", 0, 100, 0, "{:.0f}%")
+    def _new_tab(self, name):
+        frame = ttk.Frame(self.tabwrap)
+        self.tabs[name] = frame
+        btn = ttk.Button(self.tabbar, text=name, style="Tab.TButton",
+                         command=lambda n=name: self.show_tab(n))
+        btn.pack(side="left", padx=(0, 6))
+        self.tab_btns[name] = btn
+        return frame
 
-        rr = realism.grid_size()[1]
+    def show_tab(self, name):
+        for f in self.tabs.values():
+            f.pack_forget()
+        self.tabs[name].pack(fill="both", expand=True)
+        for n, b in self.tab_btns.items():
+            b.configure(style="TabOn.TButton" if n == name else "Tab.TButton")
+
+    def _tab_typing(self, t):
+        self.slider(t, "wpm", "Speed (WPM)", 15, 140, 55, "{:.0f}")
+        self.slider(t, "typo", "Typos (% of letters)", 0, 10, 3, "{:.1f}%")
+        self.slider(t, "revise", "Retype hesitations (% of words)", 0, 6, 1.5, "{:.1f}%")
+        self.slider(t, "think", "Thinking pauses (% of spaces)", 0, 15, 3, "{:.1f}%")
+        self.slider(t, "pause", "Pause length", 0.25, 3, 1.0, "{:.2f}x")
+        self.slider(t, "countdown", "Countdown", 2, 15, 5, "{:.0f}s")
+
+    def _tab_realism(self, t):
+        self.slider(t, "dwell_min", "Key hold min (ms)", 30, 120, 70, "{:.0f} ms")
+        self.slider(t, "dwell_max", "Key hold max (ms)", 60, 260, 150, "{:.0f} ms")
+        self.slider(t, "rollover_rate", "Overlap common pairs (%)", 0, 100, 0, "{:.0f}%")
+
+        r = t.grid_size()[1]
         self.rollover = tk.BooleanVar(value=False)
+        self._track("rollover", self.rollover, False)
         ttk.Checkbutton(
-            realism, variable=self.rollover,
+            t, variable=self.rollover,
             text="Allow key overlap so speeds above ~100 WPM are actually reached",
-        ).grid(row=rr, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(10, 2))
 
-        ttk.Label(realism, text="Seed").grid(row=rr + 1, column=0, sticky="w", pady=2)
+        ttk.Label(t, text="Seed").grid(row=r + 1, column=0, sticky="w", pady=6)
         self.seed = tk.StringVar(value="")
-        ttk.Entry(realism, textvariable=self.seed, width=12).grid(row=rr + 1, column=1, sticky="w", padx=8)
-        ttk.Label(realism, text="blank = random each run").grid(row=rr + 1, column=2, sticky="w")
+        self._track("seed", self.seed, "")
+        ttk.Entry(t, textvariable=self.seed, width=14).grid(row=r + 1, column=1, sticky="w", padx=12)
+        ttk.Label(t, text="blank = random each run", style="Muted.TLabel").grid(
+            row=r + 1, column=2, sticky="w")
 
-        ai = ttk.LabelFrame(body, text="AI false starts (optional)", padding=8)
-        ai.pack(fill="x", padx=12, pady=(0, 8))
+    def _tab_ai(self, t):
         self.ai_on = tk.BooleanVar(value=False)
+        self._track("ai_on", self.ai_on, False)
         ttk.Checkbutton(
-            ai, variable=self.ai_on,
+            t, variable=self.ai_on,
             text="Use Claude to type, then delete, realistic alternate sentence openings",
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-        self.slider(ai, "ai_rate", "Sentences affected", 0, 100, 25, "{:.0f}%")
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self.slider(t, "ai_rate", "Sentences affected", 0, 100, 25, "{:.0f}%")
 
-        r = ai.grid_size()[1]
-        ttk.Label(ai, text="API key").grid(row=r, column=0, sticky="w", pady=2)
+        r = t.grid_size()[1]
+        ttk.Label(t, text="API key").grid(row=r, column=0, sticky="w", pady=6)
+        # The API key is read from ANTHROPIC_API_KEY and is deliberately NOT
+        # written to the settings file (no plaintext secrets on disk).
         self.api_key = tk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", ""))
-        ttk.Entry(ai, textvariable=self.api_key, show="\u2022").grid(row=r, column=1, columnspan=2, sticky="ew", padx=8)
-        ttk.Label(ai, text="Model").grid(row=r + 1, column=0, sticky="w", pady=2)
+        ttk.Entry(t, textvariable=self.api_key, show="\u2022").grid(
+            row=r, column=1, columnspan=2, sticky="ew", padx=12)
+        ttk.Label(t, text="Model").grid(row=r + 1, column=0, sticky="w", pady=6)
         self.model = tk.StringVar(value=DEFAULT_MODEL)
-        ttk.Entry(ai, textvariable=self.model).grid(row=r + 1, column=1, columnspan=2, sticky="ew", padx=8)
+        self._track("model", self.model, DEFAULT_MODEL)
+        ttk.Entry(t, textvariable=self.model).grid(row=r + 1, column=1, columnspan=2, sticky="ew", padx=12)
+        t.columnconfigure(1, weight=1)
 
-        options = ttk.Frame(body)
-        options.pack(fill="x", padx=12, pady=(0, 10))
+    def _tab_general(self, t):
         self.minimize = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options, variable=self.minimize,
-                        text="Minimize this window when the countdown starts").pack(anchor="w")
+        self._track("minimize", self.minimize, True)
+        ttk.Checkbutton(t, variable=self.minimize,
+                        text="Minimize this window when the countdown starts").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=4)
         self.hotkeys = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options, variable=self.hotkeys,
-                        text="Enable F8 (pause) / Esc (stop) hotkeys").pack(anchor="w")
+        self._track("hotkeys", self.hotkeys, True)
+        ttk.Checkbutton(t, variable=self.hotkeys,
+                        text="Enable F8 (pause) / Esc (stop) hotkeys").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Separator(t, orient="horizontal").grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=14)
+        ttk.Button(t, text="Reset all settings to defaults", style="Ghost.TButton",
+                   command=self.reset_defaults).grid(row=3, column=0, sticky="w")
 
-        for key in ("wpm", "pause"):
-            self.vars[key].trace_add("write", lambda *_: self.update_estimate())
-        self.update_estimate()
+    # --------------------------------------------------------------- helpers --
+    def _track(self, key, var, default):
+        self._persist[key] = var
+        self._defaults[key] = default
 
-        # open at a height that fits the screen; the settings area scrolls if needed
-        root.update_idletasks()
-        want = root.winfo_reqheight()
-        screen = root.winfo_screenheight()
-        height = min(want, screen - 120)
-        root.geometry(f"600x{height}")
-
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-        root.after(100, self.poll)
-
-    # ------------------------------------------------------------ helpers --
     def slider(self, parent, key, label, lo, hi, default, fmt):
         r = parent.grid_size()[1]
         var = tk.DoubleVar(value=default)
-        value_lbl = ttk.Label(parent, width=7, anchor="e")
+        value_lbl = ttk.Label(parent, width=9, anchor="e", style="Value.TLabel")
 
         def refresh(*_):
             value_lbl.config(text=fmt.format(var.get()))
 
-        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", pady=2)
-        ttk.Scale(parent, from_=lo, to=hi, variable=var, command=refresh).grid(
-            row=r, column=1, sticky="ew", padx=8)
+        var.trace_add("write", refresh)  # fires on drags AND programmatic loads
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", pady=7)
+        ttk.Scale(parent, from_=lo, to=hi, variable=var).grid(row=r, column=1, sticky="ew", padx=12)
         value_lbl.grid(row=r, column=2, sticky="e")
         parent.columnconfigure(1, weight=1)
         refresh()
+
         self.vars[key] = var
+        self._persist[key] = var
+        self._ranges[key] = (lo, hi)
+        self._defaults[key] = default
 
     def get_text(self):
         return self.text.get("1.0", "end-1c").replace("\r\n", "\n").rstrip("\n")
@@ -249,7 +372,7 @@ class App:
             with open(path, encoding="utf-8") as f:
                 content = f.read()
         except Exception as e:
-            messagebox.showerror("Human Typer", f"Couldn't read file:\n{e}")
+            messagebox.showerror(APP_NAME, f"Couldn't read file:\n{e}")
             return
         self.text.delete("1.0", "end")
         self.text.insert("1.0", content)
@@ -260,7 +383,6 @@ class App:
         self.stop_btn.config(state="normal" if running else "disabled")
 
     def read_seed(self):
-        """Parse the seed box: an integer, or None when blank/invalid."""
         txt = self.seed.get().strip()
         if not txt:
             return None
@@ -269,15 +391,60 @@ class App:
         except ValueError:
             return None
 
-    # ------------------------------------------------------------ actions --
+    # ------------------------------------------------------- settings file ---
+    def collect_settings(self):
+        out = {}
+        for key, var in self._persist.items():
+            try:
+                out[key] = var.get()
+            except tk.TclError:
+                pass
+        return out
+
+    def apply_settings(self, data):
+        for key, var in self._persist.items():
+            if key not in data:
+                continue
+            val = data[key]
+            try:
+                if key in self._ranges:
+                    lo, hi = self._ranges[key]
+                    var.set(min(max(float(val), lo), hi))
+                elif isinstance(var, tk.BooleanVar):
+                    var.set(bool(val))
+                else:
+                    var.set("" if val is None else str(val))
+            except (tk.TclError, ValueError, TypeError):
+                pass
+
+    def load_settings(self):
+        try:
+            with open(self._settings_file, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.apply_settings(data)
+        except (OSError, ValueError):
+            pass
+
+    def save_settings(self):
+        try:
+            with open(self._settings_file, "w", encoding="utf-8") as f:
+                json.dump(self.collect_settings(), f, indent=2)
+        except OSError:
+            pass
+
+    def reset_defaults(self):
+        self.apply_settings(self._defaults)
+        self.update_estimate()
+
+    # --------------------------------------------------------------- actions --
     def start(self):
         text = self.get_text()
         if not text.strip():
-            messagebox.showinfo("Human Typer", "Paste or load some text first.")
+            messagebox.showinfo(APP_NAME, "Paste or load some text first.")
             return
 
         v = {k: var.get() for k, var in self.vars.items()}
-        # the two dwell sliders are independent, so make sure min <= max
         dwell_min = min(v["dwell_min"], v["dwell_max"])
         dwell_max = max(v["dwell_min"], v["dwell_max"])
 
@@ -300,9 +467,11 @@ class App:
         if use_ai:
             key = self.api_key.get().strip()
             if not key:
-                messagebox.showwarning("Human Typer", "AI false starts need an Anthropic API key.")
+                messagebox.showwarning(APP_NAME, "AI false starts need an Anthropic API key.")
                 return
             os.environ["ANTHROPIC_API_KEY"] = key
+
+        self.save_settings()
 
         ht.stop_event.clear()
         ht.pause_event.clear()
@@ -336,7 +505,7 @@ class App:
             self.q.put(("done", "Done."))
         except ht.Stopped:
             self.q.put(("done", "Stopped."))
-        except SystemExit as e:  # e.g. anthropic package missing
+        except SystemExit as e:
             self.q.put(("error", str(e)))
         except Exception as e:
             self.q.put(("error", f"{type(e).__name__}: {e}"))
@@ -376,7 +545,7 @@ class App:
                     self.finish()
                     self.status.config(text="Error.")
                     self.root.deiconify()
-                    messagebox.showerror("Human Typer", msg[1])
+                    messagebox.showerror(APP_NAME, msg[1])
         except queue.Empty:
             pass
 
@@ -392,6 +561,7 @@ class App:
         self.root.after(100, self.poll)
 
     def on_close(self):
+        self.save_settings()
         ht.stop_event.set()
         ht.pause_event.clear()
         if self.listener:
